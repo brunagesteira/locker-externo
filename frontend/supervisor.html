@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Supervisor</title>
+<style>
+body{ font-family:Arial, sans-serif; background:#f5f5f5; padding:20px; color:#222; }
+.login-card{
+    max-width:380px; margin:8vh auto; background:white; padding:24px; border-radius:12px;
+    box-shadow:0 2px 12px rgba(0,0,0,.08);
+}
+input{ width:100%; padding:12px; margin:8px 0 14px; border:1px solid #ddd; border-radius:8px; }
+button{ padding:10px 15px; margin:0 8px 20px 0; cursor:pointer; border:0; border-radius:8px; background:#222; color:white; }
+button.sec{ background:#666; }
+table{ width:100%; border-collapse: collapse; background:white; }
+th, td{ padding:10px; border:1px solid #ddd; text-align:left; }
+th{ background:#222; color:white; }
+.erro{ color:#b00020; display:none; margin-bottom:12px; }
+#painel{ display:none; }
+.topbar{ display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; }
+</style>
+</head>
+<body>
+
+<div id="login" class="login-card">
+    <h1>Painel Supervisor</h1>
+    <div class="erro" id="erro-login"></div>
+
+    <label>Usuário</label>
+    <input id="usuario" type="text" value="supervisor" autocomplete="username">
+
+    <label>Senha</label>
+    <input id="senha" type="password" autocomplete="current-password">
+
+    <button id="btn-login" type="button">Entrar</button>
+    <button class="sec" type="button" onclick="window.location.href='index.html'">Voltar</button>
+</div>
+
+<div id="painel">
+    <div class="topbar">
+        <h1>Painel Supervisor</h1>
+        <div>
+            <button onclick="carregar()">Atualizar</button>
+            <button onclick="baixarCSV()">Exportar CSV</button>
+            <button class="sec" onclick="sair()">Sair</button>
+        </div>
+    </div>
+
+    <div class="erro" id="erro-painel"></div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Sessão</th>
+                <th>Matrícula</th>
+                <th>Nome</th>
+                <th>Data</th>
+                <th>Tempo Logado</th>
+                <th>Tempo Pausa</th>
+                <th>Status</th>
+            </tr>
+        </thead>
+        <tbody id="tabela"></tbody>
+    </table>
+</div>
+
+<script>
+const API = "http://127.0.0.1:8000";
+let auth = sessionStorage.getItem("supervisor_auth") || "";
+
+function fmt(seg){
+    seg = Math.max(0, Math.floor(seg || 0));
+    const h = Math.floor(seg / 3600);
+    const m = Math.floor((seg % 3600) / 60);
+    const s = seg % 60;
+    return [h,m,s].map(v => String(v).padStart(2,"0")).join(":");
+}
+
+function mostrarLogin(){
+    document.getElementById("login").style.display = "block";
+    document.getElementById("painel").style.display = "none";
+}
+
+function mostrarPainel(){
+    document.getElementById("login").style.display = "none";
+    document.getElementById("painel").style.display = "block";
+}
+
+function sair(){
+    sessionStorage.removeItem("supervisor_auth");
+    auth = "";
+    mostrarLogin();
+}
+
+async function loginSupervisor(){
+    const usuario = document.getElementById("usuario").value.trim();
+    const senha = document.getElementById("senha").value;
+    const erro = document.getElementById("erro-login");
+
+    if(!usuario || !senha){
+        erro.style.display = "block";
+        erro.textContent = "Informe usuário e senha.";
+        return;
+    }
+
+    auth = btoa(`${usuario}:${senha}`);
+
+    try{
+        const res = await fetch(`${API}/api/supervisor`, {
+            headers:{ "Authorization":"Basic " + auth }
+        });
+
+        if(!res.ok) throw new Error("Credenciais inválidas");
+
+        sessionStorage.setItem("supervisor_auth", auth);
+        mostrarPainel();
+        await preencherTabela(await res.json());
+    }catch(e){
+        console.error(e);
+        sessionStorage.removeItem("supervisor_auth");
+        auth = "";
+        erro.style.display = "block";
+        erro.textContent = "Não consegui entrar. Confira a senha e se o backend está rodando.";
+    }
+}
+
+async function carregar(){
+    const erro = document.getElementById("erro-painel");
+    erro.style.display = "none";
+
+    if(!auth){
+        mostrarLogin();
+        return;
+    }
+
+    try{
+        const res = await fetch(`${API}/api/supervisor`, {
+            headers:{ "Authorization":"Basic " + auth }
+        });
+
+        if(res.status === 401){
+            sair();
+            return;
+        }
+
+        if(!res.ok) throw new Error("Erro ao carregar supervisor");
+
+        mostrarPainel();
+        await preencherTabela(await res.json());
+    }catch(e){
+        console.error(e);
+        erro.style.display = "block";
+        erro.textContent = "Erro ao carregar dados. Confira o backend.";
+    }
+}
+
+async function preencherTabela(dados){
+    const tabela = document.getElementById("tabela");
+    tabela.innerHTML = "";
+
+    if(!dados.length){
+        tabela.innerHTML = `<tr><td colspan="7">Nenhum registro encontrado.</td></tr>`;
+        return;
+    }
+
+    dados.forEach(item => {
+        tabela.innerHTML += `
+        <tr>
+            <td>${item.sessao_id}</td>
+            <td>${item.matricula}</td>
+            <td>${item.nome}</td>
+            <td>${item.data || ""}</td>
+            <td>${fmt(item.total_logado_seg)}</td>
+            <td>${fmt(item.total_pausa_seg)}</td>
+            <td>${item.status}</td>
+        </tr>`;
+    });
+}
+
+async function baixarCSV(){
+    if(!auth){
+        mostrarLogin();
+        return;
+    }
+
+    const res = await fetch(`${API}/api/supervisor/csv`, {
+        headers:{ "Authorization":"Basic " + auth }
+    });
+
+    if(!res.ok){
+        alert("Erro ao exportar CSV.");
+        return;
+    }
+
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "ponto.csv";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+}
+
+document.getElementById("btn-login").addEventListener("click", loginSupervisor);
+document.addEventListener("keydown", ev => {
+    if(ev.key === "Enter" && document.getElementById("login").style.display !== "none"){
+        loginSupervisor();
+    }
+});
+
+if(auth){
+    carregar();
+}else{
+    mostrarLogin();
+}
+
+setInterval(() => {
+    if(auth && document.getElementById("painel").style.display !== "none") carregar();
+}, 5000);
+</script>
+</body>
+</html>
