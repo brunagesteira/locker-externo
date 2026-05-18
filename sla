@@ -1,0 +1,762 @@
+# main.py (Backend FastAPI Ajustado)
+
+```python
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from typing import Optional
+import sqlite3
+import secrets
+import csv
+import io
+from datetime import datetime, date
+
+app = FastAPI(title="Sistema de Ponto", version="1.0")
+
+# ─────────────────────────────────────────────────────
+# CORS
+# ─────────────────────────────────────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ─────────────────────────────────────────────────────
+# AUTH SUPERVISOR
+# ─────────────────────────────────────────────────────
+security = HTTPBasic()
+
+SUPERVISORES = {
+    "supervisor": "senha123",
+    "admin": "admin2024"
+}
+
+
+def verificar_supervisor(credentials: HTTPBasicCredentials = Depends(security)):
+    senha_correta = SUPERVISORES.get(credentials.username)
+
+    if not senha_correta or not secrets.compare_digest(credentials.password, senha_correta):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Credenciais inválidas",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    return credentials.username
+
+# ─────────────────────────────────────────────────────
+# DATABASE
+# ─────────────────────────────────────────────────────
+
+def get_db():
+    conn = sqlite3.connect("ponto.db", check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_db()
+
+    conn.executescript("""
+
+    CREATE TABLE IF NOT EXISTS colaboradores (
+        matricula TEXT PRIMARY KEY,
+        nome TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS sessoes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        matricula TEXT NOT NULL,
+        data TEXT NOT NULL,
+        login_em TEXT NOT NULL,
+        logout_em TEXT,
+        total_logado_seg INTEGER DEFAULT 0,
+        total_pausa_seg INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'ativo'
+    );
+
+    CREATE TABLE IF NOT EXISTS eventos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sessao_id INTEGER NOT NULL,
+        matricula TEXT NOT NULL,
+        tipo TEXT NOT NULL,
+        timestamp TEXT NOT NULL
+    );
+
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+# ─────────────────────────────────────────────────────
+# MODELS
+# ─────────────────────────────────────────────────────
+
+class LoginRequest(BaseModel):
+    matricula: str
+    nome: Optional[str] = None
+
+
+class EventoRequest(BaseModel):
+    matricula: str
+    sessao_id: int
+    tipo: str
+
+
+class SyncRequest(BaseModel):
+    matricula: str
+    sessao_id: int
+    total_logado_seg: int
+    total_pausa_seg: int
+
+# ─────────────────────────────────────────────────────
+# LOGIN
+# ─────────────────────────────────────────────────────
+
+@app.post("/api/login")
+def login(req: LoginRequest):
+
+    conn = get_db()
+
+    try:
+
+        conn.execute(
+            "INSERT OR IGNORE INTO colaboradores (matricula, nome) VALUES (?, ?)",
+            (req.matricula, req.nome or req.matricula)
+        )
+
+        if req.nome:
+            conn.execute(
+                "UPDATE colaboradores SET nome = ? WHERE matricula = ?",
+                (req.nome, req.matricula)
+            )
+
+        agora = datetime.utcnow().isoformat()
+        hoje = date.today().isoformat()
+
+        conn.execute(
+            """
+            UPDATE sessoes
+            SET status = 'incompleto', logout_em = ?
+            WHERE matricula = ? AND status = 'ativo'
+            """,
+            (agora, req.matricula)
+        )
+
+        cur = conn.execute(
+            """
+            INSERT INTO sessoes (matricula, data, login_em, status)
+            VALUES (?, ?, ?, 'ativo')
+            """,
+            (req.matricula, hoje, agora)
+        )
+
+        sessao_id = cur.lastrowid
+
+        conn.execute(
+            "INSERT INTO eventos (sessao_id, matricula, tipo, timestamp) VALUES (?, ?, 'LOGIN', ?)",
+            (sessao_id, req.matricula, agora)
+        )
+
+        conn.commit()
+
+        return {
+            "ok": True,
+            "sessao_id": sessao_id,
+            "login_em": agora
+        }
+
+    finally:
+        conn.close()
+
+# ─────────────────────────────────────────────────────
+# EVENTOS
+# ─────────────────────────────────────────────────────
+
+@app.post("/api/evento")
+def registrar_evento(req: EventoRequest):
+
+    conn = get_db()
+
+    try:
+
+        agora = datetime.utcnow().isoformat()
+
+        conn.execute(
+            "INSERT INTO eventos (sessao_id, matricula, tipo, timestamp) VALUES (?, ?, ?, ?)",
+            (req.sessao_id, req.matricula, req.tipo, agora)
+        )
+
+        conn.commit()
+
+        return {
+            "ok": True
+        }
+
+    finally:
+        conn.close()
+
+# ─────────────────────────────────────────────────────
+# SYNC
+# ─────────────────────────────────────────────────────
+
+@app.post("/api/sync")
+def sync(req: SyncRequest):
+
+    conn = get_db()
+
+    try:
+
+        conn.execute(
+            """
+            UPDATE sessoes
+            SET total_logado_seg = ?, total_pausa_seg = ?
+            WHERE id = ?
+            """,
+            (
+                req.total_logado_seg,
+                req.total_pausa_seg,
+                req.sessao_id
+            )
+        )
+
+        conn.commit()
+
+        return {"ok": True}
+
+    finally:
+        conn.close()
+
+# ─────────────────────────────────────────────────────
+# LOGOUT
+# ─────────────────────────────────────────────────────
+
+@app.post("/api/logout")
+def logout(req: SyncRequest):
+
+    conn = get_db()
+
+    try:
+
+        agora = datetime.utcnow().isoformat()
+
+        conn.execute(
+            """
+            UPDATE sessoes
+            SET
+                logout_em = ?,
+                total_logado_seg = ?,
+                total_pausa_seg = ?,
+                status = 'encerrado'
+            WHERE id = ?
+            """,
+            (
+                agora,
+                req.total_logado_seg,
+                req.total_pausa_seg,
+                req.sessao_id
+            )
+        )
+
+        conn.execute(
+            "INSERT INTO eventos (sessao_id, matricula, tipo, timestamp) VALUES (?, ?, 'LOGOUT', ?)",
+            (req.sessao_id, req.matricula, agora)
+        )
+
+        conn.commit()
+
+        return {"ok": True}
+
+    finally:
+        conn.close()
+
+# ─────────────────────────────────────────────────────
+# SUPERVISOR
+# ─────────────────────────────────────────────────────
+
+@app.get("/api/supervisor/hoje")
+def supervisor_hoje(usuario: str = Depends(verificar_supervisor)):
+
+    conn = get_db()
+
+    try:
+
+        hoje = date.today().isoformat()
+
+        rows = conn.execute(
+            """
+            SELECT
+                s.id,
+                s.matricula,
+                c.nome,
+                s.login_em,
+                s.logout_em,
+                s.total_logado_seg,
+                s.total_pausa_seg,
+                s.status
+            FROM sessoes s
+            JOIN colaboradores c ON c.matricula = s.matricula
+            WHERE s.data = ?
+            ORDER BY s.login_em DESC
+            """,
+            (hoje,)
+        ).fetchall()
+
+        return [dict(r) for r in rows]
+
+    finally:
+        conn.close()
+
+# ─────────────────────────────────────────────────────
+# CSV
+# ─────────────────────────────────────────────────────
+
+@app.get("/api/supervisor/csv")
+def exportar_csv(usuario: str = Depends(verificar_supervisor)):
+
+    conn = get_db()
+
+    try:
+
+        rows = conn.execute(
+            """
+            SELECT
+                s.matricula,
+                c.nome,
+                s.total_logado_seg,
+                s.total_pausa_seg
+            FROM sessoes s
+            JOIN colaboradores c ON c.matricula = s.matricula
+            ORDER BY s.id DESC
+            """
+        ).fetchall()
+
+        output = io.StringIO()
+
+        writer = csv.writer(output)
+
+        writer.writerow([
+            "matricula",
+            "nome",
+            "tempo_logado",
+            "tempo_pausa"
+        ])
+
+        for r in rows:
+            writer.writerow([
+                r["matricula"],
+                r["nome"],
+                r["total_logado_seg"],
+                r["total_pausa_seg"]
+            ])
+
+        output.seek(0)
+
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": "attachment; filename=ponto.csv"
+            }
+        )
+
+    finally:
+        conn.close()
+
+# ─────────────────────────────────────────────────────
+# ROOT
+# ─────────────────────────────────────────────────────
+
+@app.get("/")
+def root():
+    return {
+        "status": "Sistema rodando"
+    }
+```
+
+---
+
+# index.html (Frontend Colaborador Ajustado)
+
+```html
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Registro de Ponto</title>
+
+<style>
+body{
+  font-family:Arial;
+  background:#f5f5f5;
+  display:flex;
+  justify-content:center;
+  align-items:center;
+  min-height:100vh;
+}
+
+.card{
+  background:white;
+  width:350px;
+  padding:25px;
+  border-radius:12px;
+  box-shadow:0 0 10px rgba(0,0,0,0.1);
+}
+
+input{
+  width:100%;
+  padding:12px;
+  margin-top:5px;
+  margin-bottom:15px;
+}
+
+button{
+  width:100%;
+  padding:12px;
+  border:none;
+  border-radius:8px;
+  cursor:pointer;
+  margin-top:10px;
+}
+
+.btn-dark{
+  background:black;
+  color:white;
+}
+
+.btn-pause{
+  background:orange;
+}
+
+.btn-end{
+  background:#ffcccc;
+}
+
+.screen{
+  display:none;
+}
+
+.screen.active{
+  display:block;
+}
+</style>
+</head>
+<body>
+
+<div id="screen-login" class="screen active">
+  <div class="card">
+
+    <h2>Registro de Ponto</h2>
+
+    <label>Matrícula</label>
+    <input type="text" id="inp-matricula">
+
+    <label>Nome</label>
+    <input type="text" id="inp-nome">
+
+    <button class="btn-dark" onclick="fazerLogin()">Entrar</button>
+
+    <button onclick="window.location.href='supervisor.html'">
+      Supervisor
+    </button>
+
+    <p id="erro" style="color:red"></p>
+
+  </div>
+</div>
+
+<div id="screen-dashboard" class="screen">
+
+  <div class="card">
+
+    <h2 id="dash-nome"></h2>
+    <p id="dash-matricula"></p>
+
+    <h3>Tempo Logado</h3>
+    <h1 id="t-logado">00:00:00</h1>
+
+    <h3>Tempo Pausa</h3>
+    <h1 id="t-pausa">00:00:00</h1>
+
+    <button id="btn-pausa" class="btn-pause" onclick="togglePausa()">
+      Iniciar pausa
+    </button>
+
+    <button class="btn-end" onclick="encerrarJornada()">
+      Encerrar jornada
+    </button>
+
+  </div>
+
+</div>
+
+<script>
+const API = "http://127.0.0.1:8000";
+
+let state = {
+  matricula:null,
+  nome:null,
+  sessaoId:null,
+  logadoSeg:0,
+  pausaSeg:0,
+  emPausa:false,
+  ticker:null
+};
+
+function fmt(seg){
+  const h = String(Math.floor(seg/3600)).padStart(2,'0');
+  const m = String(Math.floor((seg%3600)/60)).padStart(2,'0');
+  const s = String(seg%60).padStart(2,'0');
+
+  return `${h}:${m}:${s}`;
+}
+
+function showScreen(id){
+  document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+}
+
+async function fazerLogin(){
+
+  const matricula = document.getElementById('inp-matricula').value;
+  const nome = document.getElementById('inp-nome').value;
+
+  try{
+
+    const res = await fetch(`${API}/api/login`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        matricula,
+        nome
+      })
+    });
+
+    const data = await res.json();
+
+    state.matricula = matricula;
+    state.nome = nome;
+    state.sessaoId = data.sessao_id;
+
+    localStorage.setItem('ponto_session', JSON.stringify(state));
+
+    document.getElementById('dash-nome').textContent = nome;
+    document.getElementById('dash-matricula').textContent = matricula;
+
+    showScreen('screen-dashboard');
+
+    iniciarTimer();
+
+  }catch(e){
+    document.getElementById('erro').textContent = 'Erro ao conectar servidor';
+  }
+}
+
+function iniciarTimer(){
+
+  state.ticker = setInterval(()=>{
+
+    state.logadoSeg++;
+
+    if(state.emPausa){
+      state.pausaSeg++;
+    }
+
+    document.getElementById('t-logado').textContent = fmt(state.logadoSeg);
+    document.getElementById('t-pausa').textContent = fmt(state.pausaSeg);
+
+  },1000);
+}
+
+async function togglePausa(){
+
+  state.emPausa = !state.emPausa;
+
+  const btn = document.getElementById('btn-pausa');
+
+  if(state.emPausa){
+    btn.innerText = 'Terminar pausa';
+  }else{
+    btn.innerText = 'Iniciar pausa';
+  }
+
+  await fetch(`${API}/api/evento`,{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({
+      matricula:state.matricula,
+      sessao_id:state.sessaoId,
+      tipo:state.emPausa ? 'PAUSA_INICIO' : 'PAUSA_FIM'
+    })
+  });
+}
+
+async function encerrarJornada(){
+
+  clearInterval(state.ticker);
+
+  await fetch(`${API}/api/logout`,{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({
+      matricula:state.matricula,
+      sessao_id:state.sessaoId,
+      total_logado_seg:state.logadoSeg,
+      total_pausa_seg:state.pausaSeg
+    })
+  });
+
+  localStorage.removeItem('ponto_session');
+
+  location.reload();
+}
+
+function restaurarSessao(){
+
+  const salva = localStorage.getItem('ponto_session');
+
+  if(!salva) return;
+
+  const dados = JSON.parse(salva);
+
+  state = dados;
+
+  document.getElementById('dash-nome').textContent = state.nome;
+  document.getElementById('dash-matricula').textContent = state.matricula;
+
+  showScreen('screen-dashboard');
+
+  iniciarTimer();
+}
+
+restaurarSessao();
+</script>
+
+</body>
+</html>
+```
+
+---
+
+# supervisor.html
+
+```html
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<title>Supervisor</title>
+</head>
+<body>
+
+<h1>Painel Supervisor</h1>
+
+<button onclick="baixarCSV()">Exportar CSV</button>
+
+<table border="1" cellpadding="10">
+<thead>
+<tr>
+<th>Matrícula</th>
+<th>Nome</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody id="tbody"></tbody>
+</table>
+
+<script>
+const API = 'http://127.0.0.1:8000';
+
+const usuario = prompt('Usuário supervisor');
+const senha = prompt('Senha supervisor');
+
+const auth = btoa(`${usuario}:${senha}`);
+
+async function carregar(){
+
+  const res = await fetch(`${API}/api/supervisor/hoje`,{
+    headers:{
+      Authorization:`Basic ${auth}`
+    }
+  });
+
+  const data = await res.json();
+
+  const tbody = document.getElementById('tbody');
+
+  tbody.innerHTML = '';
+
+  data.forEach(item=>{
+
+    tbody.innerHTML += `
+      <tr>
+        <td>${item.matricula}</td>
+        <td>${item.nome}</td>
+        <td>${item.status}</td>
+      </tr>
+    `;
+  });
+}
+
+function baixarCSV(){
+  window.open(`${API}/api/supervisor/csv`, '_blank');
+}
+
+carregar();
+</script>
+
+</body>
+</html>
+```
+
+---
+
+# COMO RODAR
+
+## 1.
+
+No terminal:
+
+```bash
+pip install fastapi uvicorn
+```
+
+---
+
+## 2.
+
+Rodar backend:
+
+```bash
+uvicorn main:app --reload
+```
+
+---
+
+## 3.
+
+Abrir index.html com Live Server.
+
+---
+
+# LOGIN SUPERVISOR
+
+Usuário:
+
+```txt
+supervisor
+```
+
+Senha:
+
+```txt
+senha123
+```

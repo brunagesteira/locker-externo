@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dashboard - Ponto</title>
+
+<style>
+
+body{
+    margin:0;
+    font-family:Arial;
+    background:#f4f4f4;
+    display:flex;
+    justify-content:center;
+    align-items:center;
+    min-height:100vh;
+}
+
+.card{
+    width:350px;
+    background:white;
+    padding:30px;
+    border-radius:14px;
+    box-shadow:0 0 10px rgba(0,0,0,0.1);
+}
+
+.nome{
+    font-size:22px;
+    font-weight:bold;
+}
+
+.matricula{
+    color:gray;
+    margin-bottom:25px;
+}
+
+.timer-box{
+    margin-bottom:20px;
+}
+
+.label{
+    font-size:14px;
+    color:#666;
+}
+
+.timer{
+    font-size:34px;
+    font-weight:bold;
+}
+
+button{
+    width:100%;
+    padding:14px;
+    border:none;
+    border-radius:10px;
+    margin-top:12px;
+    cursor:pointer;
+    font-size:16px;
+}
+
+#btn-pausa{
+    background:#ffcc66;
+}
+
+.logout{
+    background:#ffb3b3;
+}
+
+</style>
+</head>
+<body>
+
+<div class="card">
+
+    <div class="nome" id="nome"></div>
+    <div class="matricula" id="matricula"></div>
+    <div id="data-atual"></div>
+
+    <div class="timer-box">
+        <div class="label">Tempo Logado</div>
+        <div class="timer" id="tempo-logado">00:00:00</div>
+    </div>
+
+    <div class="timer-box">
+        <div class="label">Tempo em Pausa</div>
+        <div class="timer" id="tempo-pausa">00:00:00</div>
+    </div>
+
+    <button id="btn-pausa" onclick="togglePausa()">
+        Iniciar pausa
+    </button>
+
+    <button class="logout" onclick="logout()">
+        Encerrar jornada
+    </button>
+
+</div>
+
+<script>
+
+const API = "http://127.0.0.1:8000";
+
+const session = {
+    matricula: localStorage.getItem("matricula"),
+    nome: localStorage.getItem("nome"),
+    sessaoId: localStorage.getItem("sessao_id"),
+    logadoSeg: Number(localStorage.getItem("logadoSeg")) || 0,
+    pausaSeg: Number(localStorage.getItem("pausaSeg")) || 0,
+    emPausa: localStorage.getItem("emPausa") === "true"
+};
+
+if(!session.matricula || !session.sessaoId){
+    window.location.href = "index.html";
+}
+
+document.getElementById("nome").textContent = session.nome;
+document.getElementById("matricula").textContent = session.matricula;
+
+document.getElementById("data-atual").textContent =
+new Date().toLocaleDateString("pt-BR", {
+    weekday:"long",
+    day:"2-digit",
+    month:"2-digit",
+    year:"numeric"
+});
+
+let logadoSeg = session.logadoSeg;
+let pausaSeg = session.pausaSeg;
+let emPausa = session.emPausa;
+function formatar(seg){
+
+    const h = String(Math.floor(seg / 3600)).padStart(2,'0');
+    const m = String(Math.floor((seg % 3600) / 60)).padStart(2,'0');
+    const s = String(seg % 60).padStart(2,'0');
+
+    return `${h}:${m}:${s}`;
+}
+
+function atualizarTela(){
+
+    document.getElementById("tempo-logado").textContent = formatar(logadoSeg);
+
+    document.getElementById("tempo-pausa").textContent = formatar(pausaSeg);
+
+}
+
+
+setInterval(()=>{
+
+    logadoSeg++;
+
+    if(emPausa){
+        pausaSeg++;
+    }
+
+    atualizarTela();
+
+    session.logadoSeg = logadoSeg;
+session.pausaSeg = pausaSeg;
+session.emPausa = emPausa;
+
+localStorage.setItem("logadoSeg", logadoSeg);
+localStorage.setItem("pausaSeg", pausaSeg);
+localStorage.setItem("emPausa", emPausa);
+   
+
+},1000);
+
+async function togglePausa(){
+
+    emPausa = !emPausa;
+
+    localStorage.setItem("emPausa", emPausa);
+
+    const btn = document.getElementById("btn-pausa");
+
+    if(emPausa){
+
+        btn.innerText = "Terminar pausa";
+        btn.style.background = "#b7f5c5";
+
+    }else{
+
+        btn.innerText = "Iniciar pausa";
+        btn.style.background = "#ffcc66";
+
+    }
+
+    try{
+
+        await fetch(`${API}/api/evento`,{
+            method:"POST",
+            headers:{
+                "Content-Type":"application/json"
+            },
+            body:JSON.stringify({
+                matricula: session.matricula,
+                sessao_id: Number(session.sessaoId),
+                tipo: emPausa ? "PAUSA_INICIO" : "PAUSA_FIM"
+            })
+        });
+
+        console.log("Evento enviado");
+
+    }catch(err){
+
+        console.log("Erro API:", err);
+
+    }
+
+}
+
+async function logout(){
+
+    await fetch(`${API}/api/logout`,{
+        method:"POST",
+        headers:{
+            "Content-Type":"application/json"
+        },
+        body:JSON.stringify({
+            matricula:session.matricula,
+            sessao_id:session.sessaoId,
+            total_logado_seg:logadoSeg,
+            total_pausa_seg:pausaSeg
+        })
+    });
+
+    localStorage.clear();
+
+    window.location.href = "index.html";
+}
+if(emPausa){
+
+    document.getElementById("btn-pausa").innerText = "Terminar pausa";
+    document.getElementById("btn-pausa").style.background = "#b7f5c5";
+
+}
+atualizarTela();
+
+</script>
+
+</body>
+</html>
+
